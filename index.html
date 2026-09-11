@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#02030a" />
+    <meta name="color-scheme" content="dark" />
+
+    <title>ASTROVITA — Immersive Exoplanet Observatory</title>
+    <meta
+      name="description"
+      content="ASTROVITA is an immersive 3D exoplanet observatory. Travel a catalog of real worlds from the NASA Exoplanet Archive, inspect them in WebGL, and read their measured scientific telemetry."
+    />
+    <meta name="author" content="ASTROVITA" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="ASTROVITA — Immersive Exoplanet Observatory" />
+    <meta
+      property="og:description"
+      content="Explore real worlds beyond our solar system. A cinematic WebGL observatory built on real data from the NASA Exoplanet Archive."
+    />
+    <meta property="og:site_name" content="ASTROVITA" />
+    <meta property="og:locale" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="ASTROVITA — Immersive Exoplanet Observatory" />
+    <meta
+      name="twitter:description"
+      content="Explore real worlds beyond our solar system. Real exoplanet data, rendered as a living observatory."
+    />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Share+Tech+Mono&display=swap"
+      rel="stylesheet"
+    />
+
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2302030a'/%3E%3Ccircle cx='32' cy='32' r='13' fill='%235ff0ff'/%3E%3Cellipse cx='32' cy='32' rx='27' ry='9' fill='none' stroke='%239d6bff' stroke-width='2.5' transform='rotate(-22 32 32)'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>
+      ASTROVITA is a WebGL observatory and requires JavaScript. The underlying scientific catalog is
+      available directly from the NASA Exoplanet Archive at
+      https://exoplanetarchive.ipac.caltech.edu/
+    </noscript>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
