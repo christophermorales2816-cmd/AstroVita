@@ -1,51 +1,73 @@
 /**
- * ASTROVITA — astronomical data access layer.
+ * FILE: src/services/exoplanetApi.js
  *
- * Single entry point for every remote or cached catalog read. React components
- * never call `fetch` themselves; they consume the normalized result of
- * `loadExoplanetCatalog()`.
+ * PURPOSE
+ *   Sole entry point for every remote or cached catalog read. Fetches the FULL
+ *   confirmed-exoplanet catalog from the NASA Exoplanet Archive TAP service
+ *   (no row cap), validates it, and hands normalized structures to the app.
+ *   React components never call fetch() directly.
  *
- * Source of truth is the NASA Exoplanet Archive TAP service, queried over its
- * public synchronous endpoint. No API key exists for this service and none is
- * required — nothing secret is ever embedded in this bundle.
+ * DEPENDENCIES
+ *   ../data/exoplanet_registry.json  bundled offline snapshot
+ *   ./dataNormalizer.js              normalizeCatalog / normalizeArchiveRow
  *
- * Reliability strategy, in order:
- *   1. LIVE    — a successful TAP query, cached to localStorage on success.
- *   2. CACHED  — the most recent successful TAP response, with its real age
- *                surfaced to the UI. Never presented as live.
- *   3. OFFLINE — the bundled snapshot in src/data/exoplanet_registry.json,
- *                labelled as a snapshot.
+ * PERFORMANCE-CRITICAL DECISIONS
+ *   - The full catalog is ~6,000 rows x 21 columns, roughly 2-3 MB of JSON.
+ *     localStorage quota is typically 5 MB PER ORIGIN, and a single setItem of
+ *     that size can throw QuotaExceededError even when nominally under the cap
+ *     (UTF-16 storage doubles the byte cost of the string). Hence the chunked
+ *     cache below: payloads over 4.5 MB are split across numbered keys with a
+ *     manifest, and reassembled on read.
+ *   - The manifest is written LAST and cleared FIRST. An interrupted write can
+ *     therefore never be mistaken for a complete one, which would otherwise
+ *     deserialize into truncated JSON and throw on every subsequent boot.
+ *   - The ADQL query is sent once. There is no pagination loop; TAP returns the
+ *     whole result set in one response and chunking happens at the cache layer.
  *
- * The archive does not always send permissive CORS headers from every network,
- * so a browser call can fail even when the service is healthy. That is treated
- * as a normal, expected condition rather than an error state: the observatory
- * degrades to the cache or the snapshot and keeps every feature working.
- * `VITE_EXOPLANET_PROXY` can be pointed at a server-side pass-through later
- * without touching any component.
+ * RELIABILITY STRATEGY (in order):
+ *   1. LIVE    successful TAP query, written to the chunked cache.
+ *   2. CACHED  last successful response, with its real age surfaced to the UI.
+ *              Never presented as live.
+ *   3. OFFLINE bundled snapshot, explicitly labelled as a snapshot.
+ *
+ * VERIFICATION NOTE
+ *   The `pl_controv_flag` predicate could not be executed against the live
+ *   service from the build environment (outbound access to
+ *   exoplanetarchive.ipac.caltech.edu is blocked there). The query therefore
+ *   runs a two-attempt strategy: the filtered query first, and on an
+ *   archive-side query error a single retry without that predicate. This costs
+ *   nothing when the column exists and prevents a hard fallback to the offline
+ *   snapshot if it does not.
  */
 
 import registry from '../data/exoplanet_registry.json'
-import { annotateWithSnapshot, normalizeArchiveRow, normalizeRegistryEntry } from './dataNormalizer.js'
+import {
+  annotateWithSnapshot,
+  normalizeArchiveRow,
+  normalizeCatalog,
+  normalizeRegistryEntry,
+} from './dataNormalizer.js'
 
 const TAP_ENDPOINT = 'https://exoplanetarchive.ipac.caltech.edu/TAP/sync'
 
 /** Optional server-side pass-through. Empty in the default static deployment. */
 const PROXY_BASE = (import.meta.env?.VITE_EXOPLANET_PROXY ?? '').trim()
 
-/**
- * Number of rows requested from the archive. The full table holds thousands of
- * planets; the observatory renders a navigable subset, so pulling the nearest
- * few hundred keeps the payload small and the star field readable.
- */
-export const CATALOG_LIMIT = 400
+const CACHE_PREFIX = 'astrovita_cache_'
+const CACHE_MANIFEST_KEY = 'cache_manifest'
+const CACHE_SCHEMA = 2
 
-const CACHE_KEY = 'astrovita.catalog.v1'
-const CACHE_SCHEMA = 1
+/** Split threshold. Below this the payload goes into a single chunk. */
+const CACHE_CHUNK_THRESHOLD = 4_500_000
 
-/** Consider a cached response stale (but still usable) after six hours. */
-export const CACHE_TTL_MS = 6 * 60 * 60 * 1000
+/** Characters per chunk once splitting kicks in. */
+const CACHE_CHUNK_SIZE = 2_000_000
 
-const REQUEST_TIMEOUT_MS = 14000
+/** Cached responses are reusable for 24 hours, per spec. */
+export const CACHE_TTL_MS = 24 * 60 * 60 * 1000
+
+/** The full catalog is a large response; allow a generous but bounded wait. */
+const REQUEST_TIMEOUT_MS = 45_000
 
 export const DATA_STATUS = {
   LIVE: 'LIVE',
@@ -53,18 +75,47 @@ export const DATA_STATUS = {
   OFFLINE: 'OFFLINE',
 }
 
-const ADQL = [
-  'select top',
-  CATALOG_LIMIT,
-  'pl_name,hostname,sy_snum,sy_pnum,discoverymethod,disc_year,pl_orbper,pl_orbsmax,',
-  'pl_rade,pl_bmasse,pl_orbeccen,pl_eqt,st_spectype,st_teff,st_rad,st_mass,sy_vmag,sy_dist',
-  'from pscomppars',
-  'where sy_dist is not null and pl_rade is not null',
-  'order by sy_dist asc',
-].join(' ')
+/* ------------------------------------------------------------------ */
+/* query                                                               */
+/* ------------------------------------------------------------------ */
 
-function buildQueryUrl() {
-  const params = new URLSearchParams({ query: ADQL, format: 'json' })
+const COLUMNS = [
+  'pl_name',
+  'hostname',
+  'sy_pnum',
+  'sy_snum',
+  'pl_orbper',
+  'pl_orbsmax',
+  'pl_rade',
+  'pl_bmasse',
+  'pl_orbeccen',
+  'pl_orbincl',
+  'pl_eqt',
+  'discoverymethod',
+  'disc_year',
+  'st_spectype',
+  'st_teff',
+  'st_rad',
+  'st_mass',
+  'sy_vmag',
+  'ra',
+  'dec',
+  'sy_dist',
+].join(',')
+
+/**
+ * @param {boolean} withControvFilter include the `pl_controv_flag = 0` predicate
+ */
+function buildAdql(withControvFilter) {
+  // sy_dist is required: without a distance a host star cannot be placed in the
+  // macro view at all, and inventing one would fabricate a measurement.
+  const predicates = ['sy_dist is not null']
+  if (withControvFilter) predicates.push('pl_controv_flag = 0')
+  return `select ${COLUMNS} from pscomppars where ${predicates.join(' and ')} order by sy_dist asc`
+}
+
+function buildQueryUrl(adql) {
+  const params = new URLSearchParams({ query: adql, format: 'json' })
   if (PROXY_BASE) {
     const separator = PROXY_BASE.includes('?') ? '&' : '?'
     return `${PROXY_BASE}${separator}${params.toString()}`
@@ -76,10 +127,6 @@ function buildQueryUrl() {
 /* transport                                                           */
 /* ------------------------------------------------------------------ */
 
-/**
- * fetch with a hard timeout, wired so an external AbortSignal (React unmount)
- * also cancels the in-flight request.
- */
 async function fetchWithTimeout(url, { signal, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs)
@@ -94,7 +141,7 @@ async function fetchWithTimeout(url, { signal, timeoutMs = REQUEST_TIMEOUT_MS } 
     const response = await fetch(url, {
       signal: controller.signal,
       headers: { Accept: 'application/json' },
-      // The archive is a public read-only service; no credentials are sent.
+      // Public read-only service; no credentials are ever sent.
       credentials: 'omit',
       mode: 'cors',
       cache: 'no-store',
@@ -114,25 +161,21 @@ async function fetchWithTimeout(url, { signal, timeoutMs = REQUEST_TIMEOUT_MS } 
 /* ------------------------------------------------------------------ */
 
 /**
- * External data is never trusted structurally. Anything that is not a plain
- * object carrying a usable planet name is dropped rather than allowed to reach
- * the renderer.
+ * External data is never structurally trusted. Anything that is not a plain
+ * object with a usable planet name is dropped before it can reach the renderer.
  */
 function validateRows(payload) {
-  if (!Array.isArray(payload)) {
-    throw new Error('archive payload was not an array')
-  }
+  if (!Array.isArray(payload)) throw new Error('archive payload was not an array')
   const rows = payload.filter(
-    (row) => row && typeof row === 'object' && !Array.isArray(row) && typeof row.pl_name === 'string',
+    (row) =>
+      row && typeof row === 'object' && !Array.isArray(row) && typeof row.pl_name === 'string',
   )
-  if (!rows.length) {
-    throw new Error('archive payload contained no usable rows')
-  }
+  if (!rows.length) throw new Error('archive payload contained no usable rows')
   return rows
 }
 
 /* ------------------------------------------------------------------ */
-/* cache                                                               */
+/* chunked cache                                                       */
 /* ------------------------------------------------------------------ */
 
 function safeLocalStorage() {
@@ -148,49 +191,115 @@ function safeLocalStorage() {
   }
 }
 
-export function readCache() {
-  const store = safeLocalStorage()
-  if (!store) return null
-  try {
-    const raw = store.getItem(CACHE_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    if (!parsed || parsed.schema !== CACHE_SCHEMA || !Array.isArray(parsed.rows)) return null
-    if (typeof parsed.fetchedAt !== 'number') return null
-    return parsed
-  } catch {
-    return null
-  }
-}
-
-function writeCache(rows) {
-  const store = safeLocalStorage()
-  if (!store) return
-  try {
-    store.setItem(
-      CACHE_KEY,
-      JSON.stringify({
-        schema: CACHE_SCHEMA,
-        datasetVersion: registry.meta.schemaVersion,
-        source: 'NASA Exoplanet Archive',
-        fetchedAt: Date.now(),
-        rowCount: rows.length,
-        rows,
-      }),
-    )
-  } catch {
-    // Quota exceeded or storage disabled: caching is an optimisation, not a
-    // requirement. The observatory keeps working without it.
-  }
-}
-
+/** Remove every chunk plus the manifest. Safe to call when nothing is cached. */
 export function clearCatalogCache() {
   const store = safeLocalStorage()
   if (!store) return
   try {
-    store.removeItem(CACHE_KEY)
+    const manifest = JSON.parse(store.getItem(CACHE_MANIFEST_KEY) ?? 'null')
+    const count = Number.isInteger(manifest?.chunks) ? manifest.chunks : 0
+    // Clear a generous superset in case a previous manifest was itself lost.
+    for (let i = 0; i < Math.max(count, 8); i += 1) {
+      store.removeItem(`${CACHE_PREFIX}${i}`)
+    }
+    store.removeItem(CACHE_MANIFEST_KEY)
   } catch {
-    /* ignore */
+    /* best effort */
+  }
+}
+
+/**
+ * Read and reassemble the cache.
+ * @returns {{rows: Array, fetchedAt: number}|null}
+ */
+export function readCache() {
+  const store = safeLocalStorage()
+  if (!store) return null
+  try {
+    const manifest = JSON.parse(store.getItem(CACHE_MANIFEST_KEY) ?? 'null')
+    if (!manifest || manifest.schema !== CACHE_SCHEMA) return null
+    if (!Number.isInteger(manifest.chunks) || manifest.chunks < 1) return null
+    if (typeof manifest.fetchedAt !== 'number') return null
+
+    // Expired entries are dropped rather than silently served as fresh.
+    if (Date.now() - manifest.fetchedAt > CACHE_TTL_MS) {
+      clearCatalogCache()
+      return null
+    }
+
+    let serialized = ''
+    for (let i = 0; i < manifest.chunks; i += 1) {
+      const part = store.getItem(`${CACHE_PREFIX}${i}`)
+      if (part === null) {
+        // A missing chunk means a partial write or an eviction. Unusable.
+        clearCatalogCache()
+        return null
+      }
+      serialized += part
+    }
+
+    const rows = JSON.parse(serialized)
+    if (!Array.isArray(rows) || !rows.length) {
+      clearCatalogCache()
+      return null
+    }
+    return { rows, fetchedAt: manifest.fetchedAt }
+  } catch {
+    clearCatalogCache()
+    return null
+  }
+}
+
+/**
+ * Serialize and write the catalog, splitting across numbered keys when the
+ * payload exceeds the single-key threshold.
+ *
+ * Any failure purges the whole cache: a half-written chunk set would fail to
+ * parse on every future boot, which is worse than no cache at all.
+ */
+function writeCache(rows) {
+  const store = safeLocalStorage()
+  if (!store) return
+
+  let serialized
+  try {
+    serialized = JSON.stringify(rows)
+  } catch {
+    return
+  }
+
+  // Always start from a clean slate so stale chunks from a larger previous
+  // payload cannot be appended onto a smaller new one.
+  clearCatalogCache()
+
+  try {
+    const chunkSize =
+      serialized.length > CACHE_CHUNK_THRESHOLD ? CACHE_CHUNK_SIZE : serialized.length
+    const chunkCount = Math.max(1, Math.ceil(serialized.length / chunkSize))
+
+    for (let i = 0; i < chunkCount; i += 1) {
+      store.setItem(`${CACHE_PREFIX}${i}`, serialized.slice(i * chunkSize, (i + 1) * chunkSize))
+    }
+
+    // Written LAST: until the manifest exists the chunks are invisible to
+    // readCache(), so an interrupted write cannot be read back as complete.
+    store.setItem(
+      CACHE_MANIFEST_KEY,
+      JSON.stringify({
+        schema: CACHE_SCHEMA,
+        chunks: chunkCount,
+        bytes: serialized.length,
+        rowCount: rows.length,
+        source: 'NASA Exoplanet Archive',
+        datasetVersion: registry.meta.schemaVersion,
+        fetchedAt: Date.now(),
+        ttlMs: CACHE_TTL_MS,
+      }),
+    )
+  } catch {
+    // Quota exceeded or storage disabled. Caching is an optimisation, never a
+    // requirement; drop the partial write and carry on.
+    clearCatalogCache()
   }
 }
 
@@ -221,30 +330,57 @@ export function getRegistryMeta() {
 /* public API                                                          */
 /* ------------------------------------------------------------------ */
 
-function buildMeta({ status, fetchedAt, count, note }) {
+/**
+ * Fetch the raw row array from the archive.
+ *
+ * Named export required by spec. Resolves to the validated raw rows; rejects
+ * only on transport failure or an unusable payload. Callers that want the
+ * graceful fallback chain should use loadExoplanetCatalog() instead.
+ *
+ * @param {{signal?: AbortSignal}} [options]
+ * @returns {Promise<Array<object>>}
+ */
+export async function fetchExoplanetCatalog({ signal } = {}) {
+  try {
+    const payload = await fetchWithTimeout(buildQueryUrl(buildAdql(true)), { signal })
+    return validateRows(payload)
+  } catch (error) {
+    if (signal?.aborted) throw error
+    // A malformed-query response is the signature of a column that does not
+    // exist on this table. Retry once without the controversial-flag predicate
+    // rather than degrading the whole catalog to the offline snapshot.
+    const retryable = /\b(400|500)\b|query|column|syntax|ADQL/i.test(error.message)
+    if (!retryable) throw error
+    const payload = await fetchWithTimeout(buildQueryUrl(buildAdql(false)), { signal })
+    return validateRows(payload)
+  }
+}
+
+function buildMeta({ status, fetchedAt, count, systemCount, note }) {
   return {
     status,
-    source:
-      status === DATA_STATUS.OFFLINE ? 'LOCAL CATALOG SNAPSHOT' : 'NASA EXOPLANET ARCHIVE',
+    source: status === DATA_STATUS.OFFLINE ? 'LOCAL CATALOG SNAPSHOT' : 'NASA EXOPLANET ARCHIVE',
     sourceUrl: 'https://exoplanetarchive.ipac.caltech.edu/',
     fetchedAt: fetchedAt ?? null,
     ageMs: fetchedAt ? Date.now() - fetchedAt : null,
     isLive: status === DATA_STATUS.LIVE,
     count,
+    systemCount,
     note,
-    queryLimit: CATALOG_LIMIT,
+    queryLimit: null,
   }
 }
 
 /**
- * Load the exoplanet catalog.
+ * Load the catalog with the full fallback chain.
  *
  * @param {object} options
- * @param {AbortSignal} [options.signal]  cancels the network request on unmount
- * @param {(stage: string) => void} [options.onStage]  boot-sequence progress
- * @param {boolean} [options.forceRefresh]  bypass a fresh cache entry
- * @returns {Promise<{planets: Array, meta: object}>} always resolves; the
- *          observatory has no failure state, only a degraded data source.
+ * @param {AbortSignal} [options.signal]
+ * @param {(stage: string) => void} [options.onStage]
+ * @param {boolean} [options.forceRefresh]
+ * @returns {Promise<{planets: Array, starSystems: Map, meta: object}>}
+ *          Always resolves. The observatory has no failure state, only a
+ *          degraded data source.
  */
 export async function loadExoplanetCatalog({ signal, onStage, forceRefresh = false } = {}) {
   const snapshot = getSnapshotPlanets()
@@ -252,24 +388,36 @@ export async function loadExoplanetCatalog({ signal, onStage, forceRefresh = fal
     if (typeof onStage === 'function') onStage(stage)
   }
 
-  const cached = readCache()
-  const cacheIsFresh = cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS
+  const buildResult = (rows, status, fetchedAt, note) => {
+    const planets = annotateWithSnapshot(rows.map(normalizeArchiveRow).filter(Boolean), snapshot)
+    const { starSystems, allPlanets } = normalizeCatalog(planets)
+    return {
+      planets: allPlanets,
+      starSystems,
+      meta: buildMeta({
+        status,
+        fetchedAt,
+        count: allPlanets.length,
+        systemCount: starSystems.size,
+        note,
+      }),
+    }
+  }
 
-  // A fresh cache short-circuits the network entirely: the archive is a shared
-  // public service and there is no reason to re-query it on every reload.
-  if (cached && cacheIsFresh && !forceRefresh) {
+  const cached = readCache()
+
+  // A valid, unexpired cache short-circuits the network entirely. The archive
+  // is a shared public service; re-querying several megabytes on every reload
+  // is neither necessary nor polite.
+  if (cached && !forceRefresh) {
     report('READING LOCAL OBSERVATORY CACHE')
     try {
-      const planets = validateRows(cached.rows).map(normalizeArchiveRow).filter(Boolean)
-      return {
-        planets: annotateWithSnapshot(planets, snapshot),
-        meta: buildMeta({
-          status: DATA_STATUS.CACHED,
-          fetchedAt: cached.fetchedAt,
-          count: planets.length,
-          note: 'Served from a recent cached archive response.',
-        }),
-      }
+      return buildResult(
+        validateRows(cached.rows),
+        DATA_STATUS.CACHED,
+        cached.fetchedAt,
+        'Served from a cached archive response.',
+      )
     } catch {
       clearCatalogCache()
     }
@@ -278,21 +426,17 @@ export async function loadExoplanetCatalog({ signal, onStage, forceRefresh = fal
   report('CONNECTING TO NASA EXOPLANET ARCHIVE')
 
   try {
-    const payload = await fetchWithTimeout(buildQueryUrl(), { signal })
-    const rows = validateRows(payload)
+    const rows = await fetchExoplanetCatalog({ signal })
     report('NORMALIZING STELLAR PARAMETERS')
-    const planets = rows.map(normalizeArchiveRow).filter(Boolean)
-    if (!planets.length) throw new Error('no rows survived normalization')
+    const result = buildResult(
+      rows,
+      DATA_STATUS.LIVE,
+      Date.now(),
+      `Live TAP query, ${rows.length} confirmed planets.`,
+    )
+    if (!result.planets.length) throw new Error('no rows survived normalization')
     writeCache(rows)
-    return {
-      planets: annotateWithSnapshot(planets, snapshot),
-      meta: buildMeta({
-        status: DATA_STATUS.LIVE,
-        fetchedAt: Date.now(),
-        count: planets.length,
-        note: `Live TAP query, nearest ${CATALOG_LIMIT} systems with a measured radius.`,
-      }),
-    }
+    return result
   } catch (error) {
     if (signal?.aborted) throw error
 
@@ -300,28 +444,27 @@ export async function loadExoplanetCatalog({ signal, onStage, forceRefresh = fal
 
     if (cached) {
       try {
-        const planets = validateRows(cached.rows).map(normalizeArchiveRow).filter(Boolean)
-        return {
-          planets: annotateWithSnapshot(planets, snapshot),
-          meta: buildMeta({
-            status: DATA_STATUS.CACHED,
-            fetchedAt: cached.fetchedAt,
-            count: planets.length,
-            note: `Archive unreachable (${error.message}). Showing the last successful response.`,
-          }),
-        }
+        return buildResult(
+          validateRows(cached.rows),
+          DATA_STATUS.CACHED,
+          cached.fetchedAt,
+          `Archive unreachable (${error.message}). Showing the last successful response.`,
+        )
       } catch {
         clearCatalogCache()
       }
     }
 
     report('LOADING BUNDLED CATALOG SNAPSHOT')
+    const { starSystems, allPlanets } = normalizeCatalog(snapshot)
     return {
-      planets: snapshot,
+      planets: allPlanets,
+      starSystems,
       meta: buildMeta({
         status: DATA_STATUS.OFFLINE,
         fetchedAt: null,
-        count: snapshot.length,
+        count: allPlanets.length,
+        systemCount: starSystems.size,
         note: `Archive unreachable (${error.message}). Showing the bundled offline snapshot.`,
       }),
     }

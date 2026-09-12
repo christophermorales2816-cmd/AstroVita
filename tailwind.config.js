@@ -57,6 +57,13 @@ export default {
           '0%': { transform: 'scaleX(0)' },
           '100%': { transform: 'scaleX(1)' },
         },
+        // Entrance for the "Regresar a Casa" control. Declared here rather than
+        // in a CSS module so it inherits the global prefers-reduced-motion
+        // suppression in index.css, which zeroes every animation duration.
+        'fade-slide-in': {
+          '0%': { opacity: '0', transform: 'translateX(-20px)' },
+          '100%': { opacity: '1', transform: 'translateX(0)' },
+        },
       },
       animation: {
         'hud-in': 'hud-in 380ms cubic-bezier(0.22, 1, 0.36, 1) both',
@@ -64,6 +71,7 @@ export default {
         'pulse-ring': 'pulse-ring 2.4s ease-out infinite',
         'blink-soft': 'blink-soft 2s ease-in-out infinite',
         'bar-grow': 'bar-grow 900ms cubic-bezier(0.22, 1, 0.36, 1) both',
+        'fade-slide-in': 'fade-slide-in 400ms ease-out both',
       },
     },
   },

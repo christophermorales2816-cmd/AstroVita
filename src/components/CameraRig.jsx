@@ -9,9 +9,16 @@ import * as THREE from 'three'
  *
  * Camera states:
  *   intro        far, high, slowly sinking; the title screen
- *   universe     wide-field view of the whole orbit field
+ *   macro        wide-field view of the whole catalog of host stars
+ *   system       settled viewing distance for one star system
  *   observation  cinematic approach and close orbit around the selected planet
  *   detail       stable presentation offset so HUD text can be read
+ *
+ * This component owns THE ONLY TWEEN.update() CALL IN THE APPLICATION. It is
+ * mounted in every view mode, which is precisely why the tween group lives
+ * here: a tween driven from a component that unmounts mid-transition (such as
+ * OrbitEngine during a return to MACRO) would stop being stepped, never fire
+ * onComplete, and strand the UI with isTransitioning stuck at true.
  *
  * Every state change is interpolated with @tweenjs/tween.js. There is no code
  * path that sets camera.position directly to a destination: even reduced-motion
@@ -22,8 +29,11 @@ import * as THREE from 'three'
  * new state.
  */
 
-const STATE_UNIVERSE = { position: new THREE.Vector3(0, 30, 68), target: new THREE.Vector3(0, 0, 0) }
-const STATE_INTRO = { position: new THREE.Vector3(0, 96, 250), target: new THREE.Vector3(0, 6, 0) }
+// The macro sphere has a radius of 500 units (see MacroView), so the wide view
+// has to sit well outside it; the system view is the spec's [0, 30, 80].
+const STATE_MACRO = { position: new THREE.Vector3(0, 240, 620), target: new THREE.Vector3(0, 0, 0) }
+const STATE_SYSTEM = { position: new THREE.Vector3(0, 30, 80), target: new THREE.Vector3(0, 0, 0) }
+const STATE_INTRO = { position: new THREE.Vector3(0, 300, 900), target: new THREE.Vector3(0, 6, 0) }
 
 const UP = new THREE.Vector3(0, 1, 0)
 const scratchDir = new THREE.Vector3()
@@ -117,9 +127,13 @@ export default function CameraRig({
     if (mode === 'intro') {
       destination = STATE_INTRO
       duration = 1400
-    } else if (mode === 'universe') {
-      destination = STATE_UNIVERSE
-      duration = 2400
+    } else if (mode === 'macro') {
+      destination = STATE_MACRO
+      // The return home covers a long distance; give it room to breathe.
+      duration = 2600
+    } else if (mode === 'system') {
+      destination = STATE_SYSTEM
+      duration = 2000
     } else {
       const planetPosition = targetId ? positionsRef.current.get(targetId) : null
       if (!planetPosition) {
@@ -129,7 +143,7 @@ export default function CameraRig({
           awaitingTarget.current = true
           return undefined
         }
-        destination = STATE_UNIVERSE
+        destination = STATE_SYSTEM
         duration = 1600
       } else if (mode === 'detail') {
         destination = observationPose(planetPosition, 4.6, 0.9, 2.2)
@@ -223,7 +237,7 @@ export default function CameraRig({
 
     // Gentle autonomous drift in the wide view when the user is idle, so the
     // observatory never looks frozen. Suppressed under reduced motion.
-    if (mode === 'universe' && !reducedMotion && !userActive.current) {
+    if ((mode === 'macro' || mode === 'system') && !reducedMotion && !userActive.current) {
       idleTime.current += delta
       if (idleTime.current > 4) {
         const angle = delta * 0.02
@@ -238,6 +252,13 @@ export default function CameraRig({
   })
 
   const isObserving = mode === 'observation' || mode === 'detail'
+  const isMacro = mode === 'macro' || mode === 'intro'
+
+  // Zoom limits are per tier: the macro sphere is 500 units across, a system is
+  // ~50, and an observed planet is a couple of units wide. One shared range
+  // would make at least two of the three unusable.
+  const minDistance = isObserving ? 2.6 : isMacro ? 60 : 14
+  const maxDistance = isObserving ? 16 : isMacro ? 1400 : 180
 
   return (
     <OrbitControls
@@ -248,8 +269,8 @@ export default function CameraRig({
       enablePan={false}
       rotateSpeed={0.55}
       zoomSpeed={0.7}
-      minDistance={isObserving ? 2.6 : 18}
-      maxDistance={isObserving ? 16 : 140}
+      minDistance={minDistance}
+      maxDistance={maxDistance}
       minPolarAngle={0.15}
       maxPolarAngle={Math.PI - 0.15}
       onStart={() => {

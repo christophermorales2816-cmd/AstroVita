@@ -1,7 +1,8 @@
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
 import * as THREE from 'three'
 import CosmicWeb from './components/CosmicWeb.jsx'
+import MacroView from './components/MacroView.jsx'
 import OrbitEngine from './components/OrbitEngine.jsx'
 import PlanetScene from './components/PlanetScene.jsx'
 import CameraRig from './components/CameraRig.jsx'
@@ -15,10 +16,21 @@ import { getCatalogFacts, loadExoplanetCatalog } from './services/exoplanetApi.j
  * Owns every piece of UI state and the single catalog load. The data flow is:
  *
  *   exoplanetApi (TAP / cache / snapshot)
- *     -> dataNormalizer (one predictable object per planet)
- *       -> App state (selection, filters, sort, favorites, progress)
- *         -> OrbitEngine + PlanetScene + CameraRig (WebGL)
+ *     -> dataNormalizer (one planet object + one StarSystem per host)
+ *       -> App state (view machine, selection, filters, sort, favorites)
+ *         -> MacroView | OrbitEngine + PlanetScene + CameraRig (WebGL)
  *         -> HUD (DOM overlay)
+ *
+ * NAVIGATION TIERS
+ *   MACRO   every catalogued host star as one interactive point cloud
+ *   SYSTEM  one star system: its host star and that star's planets
+ *   PLANET  a single world under close observation
+ *
+ * The tier lives in a useReducer machine rather than scattered booleans, so an
+ * illegal combination (a selected planet with no selected system, say) is not
+ * representable. Transitions are camera-driven: the reducer marks
+ * isTransitioning, CameraRig runs the tween, and its onArrive callback
+ * dispatches TRANSITION_END.
  *
  * Nothing inside the frame loop touches React state; the 3D layer exchanges
  * per-frame positions through a ref-held Map.
@@ -63,8 +75,83 @@ function detectQuality() {
 }
 
 const QUALITY_PRESETS = {
-  high: { stars: 9000, nebula: 1600, fieldCap: 80, dpr: [1, 2], antialias: true, highDetail: true },
-  low: { stars: 5200, nebula: 800, fieldCap: 44, dpr: [1, 1.5], antialias: false, highDetail: false },
+  high: { stars: 18000, nebula: 1600, dpr: [1, 2], antialias: true, highDetail: true },
+  // Weak GPUs get a thinner sky. The catalog itself is never reduced: this
+  // trims decoration, never information.
+  low: { stars: 6500, nebula: 700, dpr: [1, 1.5], antialias: false, highDetail: false },
+}
+
+/* ------------------------------------------------------------------ */
+/* view state machine                                                  */
+/* ------------------------------------------------------------------ */
+
+const INITIAL_VIEW = {
+  viewMode: 'MACRO',
+  selectedSystem: null,
+  selectedPlanet: null,
+  isTransitioning: false,
+  // True only while the camera is pulling back out to MACRO. Both MacroView and
+  // OrbitEngine stay mounted for that window so the tiers cross-fade instead of
+  // the system popping out of existence the instant the button is pressed.
+  returningHome: false,
+}
+
+function viewReducer(state, action) {
+  switch (action.type) {
+    case 'SELECT_SYSTEM':
+      if (!action.system) return state
+      return {
+        viewMode: 'SYSTEM',
+        selectedSystem: action.system,
+        // Re-entering a system clears any planet held from a previous visit.
+        selectedPlanet: null,
+        isTransitioning: true,
+        returningHome: false,
+      }
+
+    case 'SELECT_PLANET': {
+      if (!action.planet) return state
+      // A planet always implies its system; selecting one from the catalog list
+      // while in MACRO enters that system in the same dispatch.
+      const system = action.system ?? state.selectedSystem
+      if (!system) return state
+      return {
+        viewMode: 'PLANET',
+        selectedSystem: system,
+        selectedPlanet: action.planet,
+        isTransitioning: true,
+        returningHome: false,
+      }
+    }
+
+    case 'BACK_TO_SYSTEM':
+      if (!state.selectedSystem) return state
+      return {
+        ...state,
+        viewMode: 'SYSTEM',
+        selectedPlanet: null,
+        isTransitioning: true,
+        returningHome: false,
+      }
+
+    case 'RETURN_HOME':
+      if (state.viewMode === 'MACRO') return state
+      // The tier is NOT changed here. It flips to MACRO in TRANSITION_END, once
+      // the zoom-out has actually finished.
+      return { ...state, isTransitioning: true, returningHome: true }
+
+    case 'TRANSITION_START':
+      return { ...state, isTransitioning: true }
+
+    case 'TRANSITION_END':
+      if (state.returningHome) {
+        return { ...INITIAL_VIEW }
+      }
+      return { ...state, isTransitioning: false }
+
+    default:
+      return state
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -203,11 +290,13 @@ function createAudioCue() {
 const LIGHT_DIRECTION = new THREE.Vector3(1, 0.35, 0.6).normalize()
 
 function ObservatoryScene({
-  fieldPlanets,
-  selectedPlanet,
+  view,
+  starSystems,
   hoveredId,
   onHover,
-  onSelect,
+  onSelectPlanet,
+  onSelectSystem,
+  onHoverSystem,
   cameraMode,
   positionsRef,
   reducedMotion,
@@ -216,6 +305,7 @@ function ObservatoryScene({
   resetToken,
   onArrive,
 }) {
+  const { viewMode, selectedSystem, selectedPlanet, returningHome } = view
   const observing = cameraMode === 'observation' || cameraMode === 'detail'
 
   const getSelectedPosition = useCallback(
@@ -228,13 +318,17 @@ function ObservatoryScene({
     [selectedPlanet, positionsRef],
   )
 
+  // The macro cloud stays mounted through the whole return-home tween so the
+  // two tiers cross-fade rather than the catalog popping in on arrival.
+  const showMacro = viewMode === 'MACRO' || returningHome
+  const showSystem = Boolean(selectedSystem)
+
   return (
     <>
-      <color attach="background" args={['#02030a']} />
       <ambientLight intensity={0.28} color="#8fb3ff" />
       <directionalLight
         position={[LIGHT_DIRECTION.x * 80, LIGHT_DIRECTION.y * 80, LIGHT_DIRECTION.z * 80]}
-        intensity={1.9}
+        intensity={viewMode === 'MACRO' ? 0.8 : 1.9}
         color="#fff4e0"
       />
 
@@ -245,29 +339,35 @@ function ObservatoryScene({
         dim={observing ? 1 : 0}
       />
 
-      {/* Observatory core: the hub the visualized orbits are drawn around. */}
-      <mesh>
-        <sphereGeometry args={[0.9, 32, 32]} />
-        <meshBasicMaterial color="#5ff0ff" transparent opacity={0.35} depthWrite={false} blending={THREE.AdditiveBlending} />
-      </mesh>
-      <mesh scale={2.6}>
-        <sphereGeometry args={[0.9, 24, 24]} />
-        <meshBasicMaterial color="#4b8dff" transparent opacity={0.08} depthWrite={false} blending={THREE.AdditiveBlending} />
-      </mesh>
+      {showMacro && (
+        <MacroView
+          starSystems={starSystems}
+          onSelectSystem={onSelectSystem}
+          onHoverSystem={onHoverSystem}
+          selectedHostname={selectedSystem?.hostname ?? null}
+          positionsRef={positionsRef}
+          reducedMotion={reducedMotion}
+        />
+      )}
 
-      <OrbitEngine
-        planets={fieldPlanets}
-        selectedId={selectedPlanet?.id ?? null}
-        hoveredId={hoveredId}
-        onHover={onHover}
-        onSelect={onSelect}
-        paused={observing}
-        reducedMotion={reducedMotion}
-        dimOthers={observing}
-        positionsRef={positionsRef}
-      />
+      {showSystem && (
+        <OrbitEngine
+          // Remounting on a system change resets orbital phase and the body
+          // registry cleanly instead of leaking the previous system's refs.
+          key={selectedSystem.hostname}
+          starSystem={selectedSystem}
+          selectedId={selectedPlanet?.id ?? null}
+          hoveredId={hoveredId}
+          onHover={onHover}
+          onSelect={onSelectPlanet}
+          paused={observing}
+          reducedMotion={reducedMotion}
+          dimOthers={observing}
+          positionsRef={positionsRef}
+        />
+      )}
 
-      {selectedPlanet && (
+      {showSystem && selectedPlanet && (
         <PlanetScene
           planet={selectedPlanet}
           getPosition={getSelectedPosition}
@@ -302,15 +402,16 @@ export default function App() {
 
   // catalog
   const [catalog, setCatalog] = useState([])
+  const [starSystems, setStarSystems] = useState(() => new Map())
   const [dataMeta, setDataMeta] = useState(null)
   const [loadStage, setLoadStage] = useState('')
   const [catalogReady, setCatalogReady] = useState(false)
 
   // navigation
   const [entered, setEntered] = useState(false)
-  const [mode, setMode] = useState('universe') // 'universe' | 'observation'
-  const [selectedId, setSelectedId] = useState(null)
+  const [view, dispatch] = useReducer(viewReducer, INITIAL_VIEW)
   const [hoveredId, setHoveredId] = useState(null)
+  const [hoveredSystem, setHoveredSystem] = useState(null)
   const [resetToken, setResetToken] = useState(0)
   const [autoRotate, setAutoRotate] = useState(true)
   const [immersive, setImmersive] = useState(false)
@@ -356,9 +457,10 @@ export default function App() {
       signal: controller.signal,
       onStage: (stage) => mounted && setLoadStage(stage),
     })
-      .then(({ planets, meta }) => {
+      .then(({ planets, starSystems: systems, meta }) => {
         if (!mounted) return
         setCatalog(planets)
+        setStarSystems(systems)
         setDataMeta(meta)
         setCatalogReady(true)
       })
@@ -425,15 +527,8 @@ export default function App() {
     return list
   }, [catalog, search, filters, showFavoritesOnly, favorites, sort])
 
-  const selectedPlanet = selectedId ? (catalogById.get(selectedId) ?? null) : null
-
-  const fieldPlanets = useMemo(() => {
-    const capped = filteredPlanets.slice(0, preset.fieldCap)
-    if (selectedPlanet && !capped.some((p) => p.id === selectedPlanet.id)) {
-      capped.push(selectedPlanet)
-    }
-    return capped
-  }, [filteredPlanets, preset.fieldCap, selectedPlanet])
+  const { selectedPlanet, selectedSystem, viewMode, isTransitioning } = view
+  const selectedId = selectedPlanet?.id ?? null
 
   const comparePlanets = useMemo(
     () => compareIds.map((id) => catalogById.get(id)).filter(Boolean),
@@ -449,13 +544,40 @@ export default function App() {
     [audioEnabled],
   )
 
+  /**
+   * Enter a star system from the macro cloud.
+   * Defined here, outside JSX, so R3F mesh props never receive a fresh closure
+   * identity on every render.
+   */
+  const selectSystem = useCallback(
+    (system) => {
+      if (!system) return
+      dispatch({ type: 'SELECT_SYSTEM', system })
+      setCompareOpen(false)
+      playCue(520)
+    },
+    [playCue],
+  )
+
+  const returnHome = useCallback(() => {
+    dispatch({ type: 'RETURN_HOME' })
+    playCue(392)
+  }, [playCue])
+
+  const backToSystem = useCallback(() => {
+    dispatch({ type: 'BACK_TO_SYSTEM' })
+    playCue(440)
+  }, [playCue])
+
   const selectPlanet = useCallback(
     (id) => {
       const planet = catalogById.get(id)
       if (!planet) return
 
-      setSelectedId(id)
-      setMode('observation')
+      // Selecting from the catalog list while in MACRO enters the planet's
+      // system in the same dispatch, so the tiers can never disagree.
+      const system = starSystems.get(planet.hostStarName) ?? selectedSystem
+      dispatch({ type: 'SELECT_PLANET', planet, system })
       setCompareOpen(false)
       playCue(660)
 
@@ -466,7 +588,7 @@ export default function App() {
       setObserved(nextObserved)
 
       // Badge evaluation uses the post-update count.
-      const siblingCount = catalog.filter((p) => p.hostStarName === planet.hostStarName).length
+      const siblingCount = system?.planets.length ?? 1
       const ctx = { observedCount: nextObserved.size, siblingCount }
       const fresh = BADGES.find((b) => !earnedBadges.has(b.id) && b.test(planet, ctx))
       if (fresh) {
@@ -481,14 +603,10 @@ export default function App() {
         if (facts.length) setFactToast(facts[Math.floor(Math.random() * facts.length)])
       }
     },
-    [catalogById, catalog, observed, earnedBadges, playCue],
+    [catalogById, starSystems, selectedSystem, observed, earnedBadges, playCue],
   )
 
-  const exitObservation = useCallback(() => {
-    setMode('universe')
-    setResetToken((n) => n + 1)
-    playCue(440)
-  }, [playCue])
+  const exitObservation = backToSystem
 
   const discoverWorld = useCallback(() => {
     if (!catalog.length) return
@@ -509,7 +627,6 @@ export default function App() {
 
   const focusSelected = useCallback(() => {
     if (!selectedId) return
-    setMode('observation')
     setResetToken((n) => n + 1)
   }, [selectedId])
 
@@ -560,7 +677,12 @@ export default function App() {
     [filteredPlanets, selectedId, selectPlanet],
   )
 
-  const onArrive = useCallback(() => {}, [])
+  // CameraRig calls this when a tween completes. It is the ONLY thing that
+  // clears isTransitioning, which is what keeps the "Regresar a Casa" button
+  // disabled for exactly as long as the camera is actually moving.
+  const onArrive = useCallback(() => {
+    dispatch({ type: 'TRANSITION_END' })
+  }, [])
 
   /* ---------------- keyboard ---------------- */
 
@@ -573,9 +695,11 @@ export default function App() {
         (target.tagName === 'INPUT' || target.tagName === 'SELECT' || target.tagName === 'TEXTAREA')
 
       if (event.key === 'Escape') {
+        // Escape walks back up the tiers one step at a time.
         if (compareOpen) setCompareOpen(false)
         else if (typing) target.blur()
-        else if (mode === 'observation') exitObservation()
+        else if (viewMode === 'PLANET') backToSystem()
+        else if (viewMode === 'SYSTEM') returnHome()
         return
       }
       if (typing) return
@@ -592,6 +716,10 @@ export default function App() {
         case 'i':
         case 'I':
           setImmersive((v) => !v)
+          break
+        case 'h':
+        case 'H':
+          returnHome()
           break
         case 'Enter':
           focusSelected()
@@ -612,7 +740,16 @@ export default function App() {
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [entered, compareOpen, mode, exitObservation, discoverWorld, focusSelected, stepSelection])
+  }, [
+    entered,
+    compareOpen,
+    viewMode,
+    backToSystem,
+    returnHome,
+    discoverWorld,
+    focusSelected,
+    stepSelection,
+  ])
 
   /* ---------------- toast timers ---------------- */
 
@@ -630,7 +767,19 @@ export default function App() {
 
   /* ---------------- render ---------------- */
 
-  const cameraMode = !entered ? 'intro' : mode === 'observation' && selectedPlanet ? 'observation' : 'universe'
+  // The camera tier is derived, never stored: one source of truth (the view
+  // machine) drives both what is rendered and where the camera goes.
+  const cameraMode = !entered
+    ? 'intro'
+    : view.returningHome || viewMode === 'MACRO'
+      ? 'macro'
+      : viewMode === 'PLANET' && selectedPlanet
+        ? 'observation'
+        : 'system'
+
+  // HUD internals still speak the older two-value vocabulary; map rather than
+  // rewrite 900 lines of panel code for a rename.
+  const hudMode = viewMode === 'PLANET' ? 'observation' : 'universe'
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-void-900">
@@ -649,11 +798,13 @@ export default function App() {
       >
         <Suspense fallback={null}>
           <ObservatoryScene
-            fieldPlanets={entered ? fieldPlanets : []}
-            selectedPlanet={entered ? selectedPlanet : null}
+            view={view}
+            starSystems={starSystems}
             hoveredId={hoveredId}
             onHover={setHoveredId}
-            onSelect={selectPlanet}
+            onSelectPlanet={selectPlanet}
+            onSelectSystem={selectSystem}
+            onHoverSystem={setHoveredSystem}
             cameraMode={cameraMode}
             positionsRef={positionsRef}
             reducedMotion={reducedMotion}
@@ -682,9 +833,14 @@ export default function App() {
         <HUD
           planets={filteredPlanets}
           totalCount={catalog.length}
-          visibleCount={fieldPlanets.length}
+          visibleCount={selectedSystem ? selectedSystem.planets.length : starSystems.size}
           dataMeta={dataMeta}
-          mode={mode}
+          mode={hudMode}
+          viewMode={viewMode}
+          isTransitioning={isTransitioning}
+          onReturnHome={returnHome}
+          selectedSystem={selectedSystem}
+          hoveredSystem={hoveredSystem}
           selectedPlanet={selectedPlanet}
           hoveredId={hoveredId}
           favorites={favorites}

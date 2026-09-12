@@ -15,6 +15,8 @@
  *      the UI can label it and never present it as a measurement.
  */
 
+import * as THREE from 'three'
+
 /** Parsecs to light years. IAU definition. */
 export const PC_TO_LY = 3.2615637769
 
@@ -533,6 +535,10 @@ export function normalizeArchiveRow(row) {
     planetsInSystem: toNumber(row.sy_pnum),
     starsInSystem: toNumber(row.sy_snum),
     distanceLy: distancePc === null ? null : distancePc * PC_TO_LY,
+    distancePc,
+    ra: toNumber(row.ra),
+    dec: toNumber(row.dec),
+    orbitalInclinationDeg: toNumber(row.pl_orbincl),
     radiusEarth: toNumber(row.pl_rade),
     massEarth: toNumber(row.pl_bmasse),
     massIsMinimum: toText(row.discoverymethod) === 'Radial Velocity',
@@ -569,6 +575,12 @@ export function normalizeRegistryEntry(entry) {
     planetsInSystem: toNumber(entry.planetsInSystem),
     starsInSystem: toNumber(entry.starsInSystem),
     distanceLy: toNumber(entry.distanceLy),
+    distancePc: toNumber(entry.distanceLy) === null ? null : toNumber(entry.distanceLy) / PC_TO_LY,
+    // The snapshot carries no RA/Dec. normalizeCatalog() substitutes a
+    // deterministic pseudo-direction and flags the system accordingly.
+    ra: toNumber(entry.ra),
+    dec: toNumber(entry.dec),
+    orbitalInclinationDeg: toNumber(entry.orbitalInclinationDeg),
     radiusEarth: toNumber(entry.radiusEarth),
     massEarth: toNumber(entry.massEarth),
     massIsMinimum: Boolean(entry.massIsMinimum),
@@ -689,4 +701,186 @@ export function describeAtmosphere(planet) {
     default:
       return { headline: NOT_AVAILABLE, tone: 'neutral', species: [], note: atmosphere.note }
   }
+}
+
+/* ================================================================== */
+/* STAR SYSTEM GROUPING & STELLAR COLOUR                               */
+/*                                                                     */
+/* Added for the macro/system navigation tier. Everything above this    */
+/* line is per-planet normalization and is unchanged; the HUD, badge    */
+/* and compare layers depend on it.                                     */
+/* ================================================================== */
+
+/**
+ * Map an effective temperature to an approximation of the Planckian locus as
+ * it appears to the eye.
+ *
+ * This is a VISUALIZATION mapping, not a colorimetric conversion: it skips the
+ * blackbody spectrum, CIE colour matching and chromatic adaptation entirely and
+ * interpolates between hand-picked anchors that read correctly on a dark
+ * background. Real stars are also far less saturated to the naked eye than any
+ * of these swatches.
+ *
+ * Anchors follow the conventional spectral-class progression:
+ *   < 3500 K  M  deep orange-red
+ *   3500-5000 K  K  orange-yellow
+ *   5000-6000 K  G  pale yellow (the Sun sits near 5772 K)
+ *   6000-7500 K  F/A  white
+ *   > 7500 K  A/B  blue-white
+ *
+ * @param {number|null} teff effective temperature in kelvin
+ * @returns {THREE.Color}
+ */
+export function teffToColor(teff) {
+  // An unmeasured temperature must not be guessed. A neutral grey-white marks
+  // the star as "colour unknown" rather than implying a spectral class.
+  if (teff === null || teff === undefined || !Number.isFinite(teff)) {
+    return new THREE.Color(0.72, 0.74, 0.78)
+  }
+
+  const ANCHORS = [
+    { t: 2400, c: [1.0, 0.52, 0.32] },
+    { t: 3500, c: [1.0, 0.68, 0.46] },
+    { t: 5000, c: [1.0, 0.86, 0.68] },
+    { t: 6000, c: [1.0, 0.97, 0.92] },
+    { t: 7500, c: [0.96, 0.97, 1.0] },
+    { t: 10000, c: [0.78, 0.85, 1.0] },
+    { t: 30000, c: [0.62, 0.74, 1.0] },
+  ]
+
+  if (teff <= ANCHORS[0].t) return new THREE.Color(...ANCHORS[0].c)
+  const last = ANCHORS[ANCHORS.length - 1]
+  if (teff >= last.t) return new THREE.Color(...last.c)
+
+  for (let i = 0; i < ANCHORS.length - 1; i += 1) {
+    const a = ANCHORS[i]
+    const b = ANCHORS[i + 1]
+    if (teff >= a.t && teff <= b.t) {
+      const k = (teff - a.t) / (b.t - a.t)
+      return new THREE.Color(
+        a.c[0] + (b.c[0] - a.c[0]) * k,
+        a.c[1] + (b.c[1] - a.c[1]) * k,
+        a.c[2] + (b.c[2] - a.c[2]) * k,
+      )
+    }
+  }
+  return new THREE.Color(...last.c)
+}
+
+/**
+ * Equatorial (RA/Dec) to a unit direction vector in scene space.
+ *
+ * x = cos(dec) * cos(ra)
+ * y = cos(dec) * sin(ra)
+ * z = sin(dec)
+ *
+ * Note this puts the celestial pole on +Z while three.js treats +Y as up. The
+ * whole macro cloud is rotated as a group rather than reordering the axes here,
+ * so the astronomy stays recognisable in the source.
+ *
+ * @returns {THREE.Vector3} unit vector
+ */
+export function raDecToDirection(raDeg, decDeg) {
+  const ra = THREE.MathUtils.degToRad(raDeg)
+  const dec = THREE.MathUtils.degToRad(decDeg)
+  const cosDec = Math.cos(dec)
+  return new THREE.Vector3(cosDec * Math.cos(ra), cosDec * Math.sin(ra), Math.sin(dec))
+}
+
+/**
+ * Deterministic unit direction from a name, for systems with no catalogued
+ * sky position (every entry in the bundled offline snapshot).
+ *
+ * The DISTANCE of such a system is still a real measurement and is used as-is;
+ * only the DIRECTION is synthetic. StarSystem.hasSkyPosition is false for these
+ * so the UI can label the macro view honestly instead of passing a scatter plot
+ * off as a star chart.
+ */
+function pseudoDirection(name) {
+  const u = hashString(`${name}:dec`) * 2 - 1
+  const theta = hashString(`${name}:ra`) * Math.PI * 2
+  const r = Math.sqrt(Math.max(0, 1 - u * u))
+  return new THREE.Vector3(r * Math.cos(theta), r * Math.sin(theta), u)
+}
+
+/**
+ * Group normalized planets into star systems.
+ *
+ * @param {Array} planets  output of normalizeArchiveRow / normalizeRegistryEntry
+ * @returns {{starSystems: Map<string, object>, allPlanets: Array}}
+ *
+ * StarSystem shape:
+ *   hostname         string
+ *   ra, dec          number|null   degrees, null when uncatalogued
+ *   dist             number|null   PARSECS (the archive's native unit)
+ *   distanceLy       number|null   convenience, same measurement
+ *   starRadius       number|null   solar radii
+ *   starMass         number|null   solar masses
+ *   starTeff         number|null   kelvin
+ *   starType         string|null   spectral type where published
+ *   color            THREE.Color   derived from starTeff
+ *   direction        THREE.Vector3 unit vector, real or pseudo
+ *   hasSkyPosition   boolean       false => direction is synthetic
+ *   planets          Planet[]      sorted by semi-major axis, innermost first
+ *   worldPosition    null          filled in by MacroView at render time
+ */
+export function normalizeCatalog(planets) {
+  const starSystems = new Map()
+
+  for (const planet of planets) {
+    const hostname = planet.hostStarName ?? UNKNOWN
+    let system = starSystems.get(hostname)
+
+    if (!system) {
+      const ra = planet.ra ?? null
+      const dec = planet.dec ?? null
+      const hasSkyPosition = ra !== null && dec !== null
+      system = {
+        hostname,
+        ra,
+        dec,
+        dist: planet.distancePc ?? (planet.distanceLy === null ? null : planet.distanceLy / PC_TO_LY),
+        distanceLy: planet.distanceLy,
+        starRadius: planet.hostStarRadiusSolar,
+        starMass: planet.hostStarMassSolar,
+        starTeff: planet.hostStarTemperatureK,
+        starType: planet.hostStarType,
+        color: teffToColor(planet.hostStarTemperatureK),
+        direction: hasSkyPosition ? raDecToDirection(ra, dec) : pseudoDirection(hostname),
+        hasSkyPosition,
+        planets: [],
+        worldPosition: null,
+      }
+      starSystems.set(hostname, system)
+    } else {
+      // Stellar parameters are per-system but the archive repeats them on every
+      // planet row. Fill any gap the first row left rather than overwriting a
+      // value that is already present.
+      if (system.starRadius === null) system.starRadius = planet.hostStarRadiusSolar
+      if (system.starMass === null) system.starMass = planet.hostStarMassSolar
+      if (system.starTeff === null) {
+        system.starTeff = planet.hostStarTemperatureK
+        system.color = teffToColor(system.starTeff)
+      }
+      if (system.starType === null) system.starType = planet.hostStarType
+      if (system.distanceLy === null) system.distanceLy = planet.distanceLy
+    }
+
+    system.planets.push(planet)
+  }
+
+  // Order each system innermost-first. Planets with no measured semi-major axis
+  // fall to the end rather than being assigned a fabricated orbit.
+  for (const system of starSystems.values()) {
+    system.planets.sort((a, b) => {
+      const ka = a.semiMajorAxisAu
+      const kb = b.semiMajorAxisAu
+      if (ka === null && kb === null) return a.name.localeCompare(b.name)
+      if (ka === null) return 1
+      if (kb === null) return -1
+      return ka - kb
+    })
+  }
+
+  return { starSystems, allPlanets: planets }
 }

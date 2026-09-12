@@ -25,8 +25,14 @@ archive's, unaltered.
 - **Custom GLSL shaders** — simplex-noise surface shader with eight visual
   profiles (rocky, ocean, gas giant, hot Jupiter, ice, lava, Hycean, tidally
   locked) and a Fresnel atmosphere halo tinted by *detected* atmospheric species.
-- **10,600-particle cosmic environment** on desktop (9,000 stars + 1,600 nebula
-  sprites) in three draw calls; 6,000 on low-power devices.
+- **Two-tier navigation.** A MACRO point cloud holds every catalogued host star,
+  placed from its measured RA/Dec and distance and coloured by its effective
+  temperature. Click one to fly into that SYSTEM; click a planet to observe it.
+  "Regresar a Casa" pulls back out.
+- **19,600-particle cosmic environment** on desktop (18,000 stars along a
+  Gaussian galactic band plus 1,600 nebula sprites) in two draw calls, with
+  12 instanced shooting stars and a 40-body debris ring in two more — four
+  total; 7,200 particles on low-power devices.
 - **Search, filter, sort** — by name / host star / class; rocky, giant, habitable
   zone, nearby, hot, cold, recent, transit, atmosphere detected; six sort keys.
 - **Compare mode** — up to three worlds side by side, derived values labelled.
@@ -111,17 +117,40 @@ works without it; it will simply run from cache or the snapshot.
 `https://exoplanetarchive.ipac.caltech.edu/TAP/sync`:
 
 ```sql
-select top 400
-  pl_name, hostname, sy_snum, sy_pnum, discoverymethod, disc_year,
-  pl_orbper, pl_orbsmax, pl_rade, pl_bmasse, pl_orbeccen, pl_eqt,
-  st_spectype, st_teff, st_rad, st_mass, sy_vmag, sy_dist
+select
+  pl_name, hostname, sy_pnum, sy_snum, pl_orbper, pl_orbsmax,
+  pl_rade, pl_bmasse, pl_orbeccen, pl_orbincl, pl_eqt,
+  discoverymethod, disc_year, st_spectype, st_teff, st_rad, st_mass,
+  sy_vmag, ra, dec, sy_dist
 from pscomppars
-where sy_dist is not null and pl_rade is not null
+where sy_dist is not null and pl_controv_flag = 0
 order by sy_dist asc
 ```
 
-No API key exists for this service and none is embedded. The 400-row cap keeps
-the payload small; the full table holds thousands of planets.
+No API key exists for this service and none is embedded. There is no row cap:
+the full confirmed catalog is fetched, roughly 6,000 planets across ~4,500 host
+systems, about 2-3 MB of JSON.
+
+`sy_dist is not null` is required rather than cosmetic — a host star with no
+distance cannot be placed in the macro view at all, and inventing one would
+fabricate a measurement.
+
+**One caveat, stated plainly:** the `pl_controv_flag` predicate could not be
+executed against the live service from the environment this was built in, which
+blocks outbound access to the archive. `fetchExoplanetCatalog()` therefore runs
+the filtered query first and retries once without that predicate if the archive
+returns a query error, so a column mismatch degrades to an unfiltered catalog
+rather than to the offline snapshot. Verify against the live archive before
+relying on the controversial-detection filter.
+
+### localStorage chunking
+
+The full catalog exceeds what a single `localStorage` key reliably holds — the
+quota is typically 5 MB per origin and strings are stored as UTF-16. Payloads
+over 4.5 MB are split across `astrovita_cache_0..N` with a `cache_manifest` key
+recording chunk count and a 24-hour TTL. The manifest is written **last** and
+cleared **first**, so an interrupted write is invisible to the reader rather
+than being deserialized as truncated JSON on every later boot.
 
 ### Local snapshot (fallback)
 
@@ -206,10 +235,14 @@ Read these before citing anything from the screen.
 
 ### Particle counts
 
-| Tier | Stars | Nebula sprites | Orbit bodies plotted | DPR cap | Sphere segments |
-|------|-------|----------------|----------------------|---------|-----------------|
-| high | 9,000 | 1,600          | 80                   | 2       | 96              |
-| low  | 5,200 | 800            | 44                   | 1.5     | 56              |
+| Tier | Stars  | Nebula sprites | Shooting stars | Debris | DPR cap | Sphere segments |
+|------|--------|----------------|----------------|--------|---------|-----------------|
+| high | 18,000 | 1,600          | 12             | 40     | 2       | 96              |
+| low  | 6,500  | 700            | 12             | 40     | 1.5     | 56              |
+
+The macro cloud renders one point per host system — every one of them, at every
+tier. It is a single draw call, so capping it would cost information without
+buying frame time.
 
 Scientific information is identical across tiers; only rendering cost differs.
 

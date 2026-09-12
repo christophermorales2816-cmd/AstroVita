@@ -782,6 +782,57 @@ function Toast({ title, body, tone, onDismiss }) {
 /* root                                                                */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* return to macro view                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * "Regresar a Casa" — the escape hatch out of SYSTEM and PLANET back to the
+ * macro star catalog.
+ *
+ * Rendered only when viewMode !== 'MACRO'. It is disabled for the duration of
+ * the zoom-out tween: without that guard a second click mid-flight dispatches a
+ * second RETURN_HOME, restarts the tween from the new camera position, and the
+ * transition visibly stutters.
+ *
+ * The entrance animation is `animate-fade-slide-in`, defined as a Tailwind
+ * keyframe extension in tailwind.config.js. It is applied via a class rather
+ * than an inline style object so it participates in the project's existing
+ * prefers-reduced-motion suppression, which zeroes every animation duration.
+ */
+function ReturnHomeButton({ viewMode, isTransitioning, onReturnHome }) {
+  if (viewMode === 'MACRO') return null
+
+  return (
+    <button
+      type="button"
+      onClick={onReturnHome}
+      disabled={isTransitioning}
+      aria-label="Regresar a la vista general del catálogo"
+      className={`animate-fade-slide-in pointer-events-auto fixed left-6 top-6 z-50 flex items-center gap-2 rounded-full border border-white/20 bg-black/60 px-5 py-3 text-sm font-semibold uppercase tracking-widest text-white backdrop-blur-md transition-all duration-300 hover:border-white/50 hover:bg-white/10 ${
+        isTransitioning ? 'pointer-events-none opacity-50' : 'cursor-pointer'
+      }`}
+    >
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+        focusable="false"
+      >
+        <line x1="19" y1="12" x2="5" y2="12" />
+        <polyline points="12 19 5 12 12 5" />
+      </svg>
+      Regresar a Casa
+    </button>
+  )
+}
+
 export default function HUD(props) {
   const {
     planets,
@@ -826,6 +877,9 @@ export default function HUD(props) {
     onDismissFact,
     reducedMotion,
     searchInputRef,
+    viewMode,
+    isTransitioning,
+    onReturnHome,
   } = props
 
   const [mobilePanel, setMobilePanel] = useState(null)
@@ -840,6 +894,11 @@ export default function HUD(props) {
 
   return (
     <div className="pointer-events-none absolute inset-0 z-20 select-none">
+      <ReturnHomeButton
+        viewMode={viewMode}
+        isTransitioning={isTransitioning}
+        onReturnHome={onReturnHome}
+      />
       <TopBar
         dataMeta={dataMeta}
         mode={mode}
