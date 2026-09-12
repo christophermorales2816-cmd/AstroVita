@@ -25,6 +25,16 @@ archive's, unaltered.
 - **Custom GLSL shaders** — simplex-noise surface shader with eight visual
   profiles (rocky, ocean, gas giant, hot Jupiter, ice, lava, Hycean, tidally
   locked) and a Fresnel atmosphere halo tinted by *detected* atmospheric species.
+- **Real-time local sky portal.** The main view is the observer's own sky:
+  every catalogued host star drawn where it actually is *right now* from a
+  chosen location, on a horizon dome you stand inside and look around 360°.
+  Positions are reduced from measured RA/Dec through Julian Date → Greenwich
+  sidereal time → local sidereal time → hour angle → altitude/azimuth (Meeus,
+  *Astronomical Algorithms*), refreshed every two seconds. A telescope-bearing
+  readout shows the current gaze; a location picker offers curated sites or
+  the browser's geolocation. Hover a star for its name, planet count and
+  distance; click to enter the system. The reduction is unit-tested against
+  published values (`node src/services/skyPosition.js`).
 - **Two-tier navigation.** A MACRO point cloud holds every catalogued host star,
   placed from its measured RA/Dec and distance and coloured by its effective
   temperature. Click one to fly into that SYSTEM; click a planet to observe it.
@@ -187,6 +197,16 @@ used, still labelled as cached. Cache is never shown as `LIVE`.
   ARTISTIC MODEL`.
 
 ---
+
+### What the sky portal does and does not claim
+
+Directions are real: catalogued RA/Dec reduced to your horizon for the current
+UTC. Precession since J2000, nutation, refraction and proper motion are
+omitted; together they are under one degree, below the angular size of a
+rendered point. Every star sits at the same dome radius because the eye cannot
+perceive stellar distance either — distance is a number in the tooltip, never
+encoded as depth. Systems from the offline snapshot carry no catalogued RA/Dec;
+they receive a stable pseudo-position and their tooltip says so.
 
 ## Scientific caveats
 

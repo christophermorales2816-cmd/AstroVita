@@ -9,6 +9,9 @@ import * as THREE from 'three'
  *
  * Camera states:
  *   intro        far, high, slowly sinking; the title screen
+ *   sky          the observer's own position: camera at the origin, looking
+ *                out at the horizon dome. SkyView owns the gaze in this state
+ *                and OrbitControls is disabled and NOT updated.
  *   macro        wide-field view of the whole catalog of host stars
  *   system       settled viewing distance for one star system
  *   observation  cinematic approach and close orbit around the selected planet
@@ -32,6 +35,8 @@ import * as THREE from 'three'
 // The macro sphere has a radius of 500 units (see MacroView), so the wide view
 // has to sit well outside it; the system view is the spec's [0, 30, 80].
 const STATE_MACRO = { position: new THREE.Vector3(0, 240, 620), target: new THREE.Vector3(0, 0, 0) }
+// The observer stands at the origin looking north along the horizon.
+const STATE_SKY = { position: new THREE.Vector3(0, 0, 0), target: new THREE.Vector3(0, 0.18, -1) }
 const STATE_SYSTEM = { position: new THREE.Vector3(0, 30, 80), target: new THREE.Vector3(0, 0, 0) }
 const STATE_INTRO = { position: new THREE.Vector3(0, 300, 900), target: new THREE.Vector3(0, 6, 0) }
 
@@ -87,6 +92,7 @@ export default function CameraRig({
   // (its orbit body mounts on the same commit). We wait for it instead of
   // flying to the wrong place.
   const awaitingTarget = useRef(false)
+  const previousMode = useRef(mode)
   const [retry, setRetry] = useState(0)
 
   // One mutable object drives every tween; no allocations on the frame loop.
@@ -114,11 +120,18 @@ export default function CameraRig({
     current.px = camera.position.x
     current.py = camera.position.y
     current.pz = camera.position.z
-    if (controls) {
+    if (previousMode.current === 'sky' || !controls) {
+      // SkyView drove the gaze directly; OrbitControls' target is stale.
+      camera.getWorldDirection(scratchDir)
+      current.tx = camera.position.x + scratchDir.x
+      current.ty = camera.position.y + scratchDir.y
+      current.tz = camera.position.z + scratchDir.z
+    } else {
       current.tx = controls.target.x
       current.ty = controls.target.y
       current.tz = controls.target.z
     }
+    previousMode.current = mode
 
     let destination
     let duration
@@ -127,6 +140,9 @@ export default function CameraRig({
     if (mode === 'intro') {
       destination = STATE_INTRO
       duration = 1400
+    } else if (mode === 'sky') {
+      destination = STATE_SKY
+      duration = 2600
     } else if (mode === 'macro') {
       destination = STATE_MACRO
       // The return home covers a long distance; give it room to breathe.
@@ -167,7 +183,8 @@ export default function CameraRig({
       flying.current = false
       idleTime.current = 0
       if (controls) {
-        controls.enabled = true
+        // In the sky state SkyView owns the camera; controls stay off.
+        controls.enabled = mode !== 'sky'
         controls.target.set(current.tx, current.ty, current.tz)
         controls.update()
       }
@@ -235,6 +252,10 @@ export default function CameraRig({
     const controls = controlsRef.current
     if (!controls || flying.current) return
 
+    // SkyView applies yaw/pitch directly; an OrbitControls.update() here would
+    // overwrite it with a lookAt every frame. Hands off.
+    if (mode === 'sky') return
+
     // Gentle autonomous drift in the wide view when the user is idle, so the
     // observatory never looks frozen. Suppressed under reduced motion.
     if ((mode === 'macro' || mode === 'system') && !reducedMotion && !userActive.current) {
@@ -269,6 +290,7 @@ export default function CameraRig({
       enablePan={false}
       rotateSpeed={0.55}
       zoomSpeed={0.7}
+      enabled={mode !== 'sky'}
       minDistance={minDistance}
       maxDistance={maxDistance}
       minPolarAngle={0.15}

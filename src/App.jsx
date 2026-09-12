@@ -3,12 +3,15 @@ import { Canvas } from '@react-three/fiber'
 import * as THREE from 'three'
 import CosmicWeb from './components/CosmicWeb.jsx'
 import MacroView from './components/MacroView.jsx'
+import SkyView from './components/SkyView.jsx'
+import SkyControls from './components/SkyControls.jsx'
 import OrbitEngine from './components/OrbitEngine.jsx'
 import PlanetScene from './components/PlanetScene.jsx'
 import CameraRig from './components/CameraRig.jsx'
 import HUD, { FILTERS, SORTS } from './components/HUD.jsx'
 import LoadingSequence from './components/LoadingSequence.jsx'
 import { getCatalogFacts, loadExoplanetCatalog } from './services/exoplanetApi.js'
+import { DEFAULT_LOCATION, OBSERVER_LOCATIONS } from './services/skyPosition.js'
 
 /**
  * ASTROVITA — application root.
@@ -22,7 +25,9 @@ import { getCatalogFacts, loadExoplanetCatalog } from './services/exoplanetApi.j
  *         -> HUD (DOM overlay)
  *
  * NAVIGATION TIERS
- *   MACRO   every catalogued host star as one interactive point cloud
+ *   MACRO   every catalogued host star. Two projections of the same data:
+ *             sky       the observer's real local sky, right now, 360 degrees
+ *             galactic  a 3D cloud placed by RA/Dec/distance
  *   SYSTEM  one star system: its host star and that star's planets
  *   PLANET  a single world under close observation
  *
@@ -163,6 +168,29 @@ const STORAGE_KEYS = {
   observed: 'astrovita.observed.v1',
   badges: 'astrovita.badges.v1',
   audio: 'astrovita.audio.v1',
+  location: 'astrovita.location.v1',
+  projection: 'astrovita.projection.v1',
+}
+
+function readLocation() {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEYS.location)
+    if (!raw) return DEFAULT_LOCATION
+    const parsed = JSON.parse(raw)
+    if (
+      parsed &&
+      typeof parsed.name === 'string' &&
+      Number.isFinite(parsed.latitude) &&
+      Number.isFinite(parsed.longitude) &&
+      Math.abs(parsed.latitude) <= 90 &&
+      Math.abs(parsed.longitude) <= 180
+    ) {
+      return OBSERVER_LOCATIONS.find((l) => l.id === parsed.id) ?? parsed
+    }
+  } catch {
+    /* fall through */
+  }
+  return DEFAULT_LOCATION
 }
 
 function readSet(key) {
@@ -292,6 +320,10 @@ const LIGHT_DIRECTION = new THREE.Vector3(1, 0.35, 0.6).normalize()
 function ObservatoryScene({
   view,
   starSystems,
+  projection,
+  location,
+  bearingRef,
+  skyActive,
   hoveredId,
   onHover,
   onSelectPlanet,
@@ -339,7 +371,20 @@ function ObservatoryScene({
         dim={observing ? 1 : 0}
       />
 
-      {showMacro && (
+      {showMacro && projection === 'sky' && (
+        <SkyView
+          starSystems={starSystems}
+          location={location}
+          onSelectSystem={onSelectSystem}
+          onHoverSystem={onHoverSystem}
+          selectedHostname={selectedSystem?.hostname ?? null}
+          bearingRef={bearingRef}
+          active={skyActive}
+          reducedMotion={reducedMotion}
+        />
+      )}
+
+      {showMacro && projection === 'galactic' && (
         <MacroView
           starSystems={starSystems}
           onSelectSystem={onSelectSystem}
@@ -412,6 +457,18 @@ export default function App() {
   const [view, dispatch] = useReducer(viewReducer, INITIAL_VIEW)
   const [hoveredId, setHoveredId] = useState(null)
   const [hoveredSystem, setHoveredSystem] = useState(null)
+
+  // sky portal
+  const [location, setLocation] = useState(readLocation)
+  const [projection, setProjection] = useState(() => {
+    try {
+      return window.localStorage.getItem(STORAGE_KEYS.projection) === 'galactic' ? 'galactic' : 'sky'
+    } catch {
+      return 'sky'
+    }
+  })
+  // Written by SkyView every frame, sampled by the DOM readout at 10 Hz.
+  const bearingRef = useRef({ azimuth: 0, altitude: 0 })
   const [resetToken, setResetToken] = useState(0)
   const [autoRotate, setAutoRotate] = useState(true)
   const [immersive, setImmersive] = useState(false)
@@ -479,6 +536,20 @@ export default function App() {
   useEffect(() => writeSet(STORAGE_KEYS.favorites, favorites), [favorites])
   useEffect(() => writeSet(STORAGE_KEYS.observed, observed), [observed])
   useEffect(() => writeSet(STORAGE_KEYS.badges, earnedBadges), [earnedBadges])
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_KEYS.location, JSON.stringify(location))
+    } catch {
+      /* ignore */
+    }
+  }, [location])
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_KEYS.projection, projection)
+    } catch {
+      /* ignore */
+    }
+  }, [projection])
   useEffect(() => {
     try {
       window.localStorage.setItem(STORAGE_KEYS.audio, audioEnabled ? '1' : '0')
@@ -772,7 +843,9 @@ export default function App() {
   const cameraMode = !entered
     ? 'intro'
     : view.returningHome || viewMode === 'MACRO'
-      ? 'macro'
+      ? projection === 'sky'
+        ? 'sky'
+        : 'macro'
       : viewMode === 'PLANET' && selectedPlanet
         ? 'observation'
         : 'system'
@@ -780,6 +853,14 @@ export default function App() {
   // HUD internals still speak the older two-value vocabulary; map rather than
   // rewrite 900 lines of panel code for a rename.
   const hudMode = viewMode === 'PLANET' ? 'observation' : 'universe'
+
+  // SkyView owns the camera only when the portal is settled: never during a
+  // tween, never once a system is being entered.
+  const skyActive = entered && viewMode === 'MACRO' && !isTransitioning && !view.returningHome
+
+  const toggleProjection = useCallback(() => {
+    setProjection((p) => (p === 'sky' ? 'galactic' : 'sky'))
+  }, [])
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-void-900">
@@ -800,6 +881,10 @@ export default function App() {
           <ObservatoryScene
             view={view}
             starSystems={starSystems}
+            projection={projection}
+            location={location}
+            bearingRef={bearingRef}
+            skyActive={skyActive}
             hoveredId={hoveredId}
             onHover={setHoveredId}
             onSelectPlanet={selectPlanet}
@@ -878,6 +963,19 @@ export default function App() {
           onDismissFact={() => setFactToast(null)}
           reducedMotion={reducedMotion}
           searchInputRef={searchInputRef}
+        />
+      )}
+
+      {entered && viewMode === 'MACRO' && (
+        <SkyControls
+          location={location}
+          onChangeLocation={setLocation}
+          bearingRef={bearingRef}
+          systemCount={starSystems.size}
+          planetCount={catalog.length}
+          projection={projection}
+          onToggleProjection={toggleProjection}
+          hidden={immersive}
         />
       )}
 
